@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
+import { AuthProvider } from "./lib/auth/AuthContext";
+import { createClient } from "./lib/supabase/server";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -16,17 +18,29 @@ export const metadata: Metadata = {
   title: "Gemini Wrapper",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const {
+    data: { session },
+  } = await supabase.auth.getSession();
+
   return (
     <html
       lang="en"
       className={`${geistSans.variable} ${geistMono.variable} antialiased`}
     >
-      <body>{children}</body>
+      <body>
+        <AuthProvider initialUser={user} initialSession={session}>
+          {children}
+        </AuthProvider>
+      </body>
     </html>
   );
 }
