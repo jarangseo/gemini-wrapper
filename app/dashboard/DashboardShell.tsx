@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useAuth } from "@/app/lib/auth/AuthContext";
 import { PromptBox } from "@/app/components/PromptBox";
 
@@ -424,7 +425,7 @@ function Sidebar({
         <span className="text-sm font-semibold tracking-tight">Gemini Wrapper</span>
       </div>
 
-      <div className="px-3">
+      <div className="space-y-2 px-3">
         <button
           type="button"
           onClick={onNewChat}
@@ -433,6 +434,12 @@ function Sidebar({
         >
           <PlusIcon className="h-4 w-4" />새 대화
         </button>
+        <Link
+          href="/dashboard/billing"
+          className="flex h-10 w-full items-center gap-2 rounded-lg px-3 text-sm font-medium text-muted-foreground transition hover:bg-accent hover:text-foreground"
+        >
+          <CardIcon className="h-4 w-4" />Billing
+        </Link>
       </div>
 
       <div className="custom-scrollbar mt-4 flex-1 overflow-y-auto px-2">
@@ -686,6 +693,16 @@ function PlusIcon(props: React.SVGProps<SVGSVGElement>) {
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
       <path d="M12 5v14" />
       <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function CardIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <rect x="2" y="5" width="20" height="14" rx="2" />
+      <path d="M2 10h20" />
+      <path d="M6 15h4" />
     </svg>
   );
 }
