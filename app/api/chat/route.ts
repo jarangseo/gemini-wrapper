@@ -5,6 +5,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const USAGE_SENTINEL = "__USAGE__";
+const TITLE_MAX_LEN = 80;
 
 type IncomingMessage = {
   role: "user" | "assistant";
@@ -12,6 +13,7 @@ type IncomingMessage = {
 };
 
 type RequestBody = {
+  conversationId?: string;
   messages?: IncomingMessage[];
 };
 
@@ -41,11 +43,65 @@ export async function POST(request: Request) {
   }
 
   const messages = body.messages;
+  const conversationId = body.conversationId;
+
+  if (!conversationId || typeof conversationId !== "string") {
+    return Response.json(
+      { error: "conversationId is required" },
+      { status: 400 },
+    );
+  }
+
   if (!Array.isArray(messages) || messages.length === 0) {
     return Response.json(
       { error: "messages must be a non-empty array" },
       { status: 400 },
     );
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  if (lastMessage.role !== "user" || !lastMessage.content?.trim()) {
+    return Response.json(
+      { error: "last message must be a non-empty user message" },
+      { status: 400 },
+    );
+  }
+
+  const { data: convo, error: convoError } = await supabase
+    .from("conversations")
+    .select("id, title")
+    .eq("id", conversationId)
+    .eq("user_id", user.id)
+    .maybeSingle();
+
+  if (convoError) {
+    return Response.json({ error: convoError.message }, { status: 500 });
+  }
+  if (!convo) {
+    return Response.json({ error: "Conversation not found" }, { status: 404 });
+  }
+
+  const { count: existingCount } = await supabase
+    .from("messages")
+    .select("id", { count: "exact", head: true })
+    .eq("conversation_id", conversationId);
+
+  const isFirstMessage = (existingCount ?? 0) === 0;
+
+  const { error: insertUserErr } = await supabase.from("messages").insert({
+    conversation_id: conversationId,
+    role: "user",
+    content: lastMessage.content,
+  });
+  if (insertUserErr) {
+    return Response.json({ error: insertUserErr.message }, { status: 500 });
+  }
+
+  if (isFirstMessage) {
+    await supabase
+      .from("conversations")
+      .update({ title: lastMessage.content.slice(0, TITLE_MAX_LEN) })
+      .eq("id", conversationId);
   }
 
   const contents = messages
@@ -54,13 +110,6 @@ export async function POST(request: Request) {
       role: m.role === "assistant" ? "model" : "user",
       parts: [{ text: m.content }],
     }));
-
-  if (contents.length === 0) {
-    return Response.json(
-      { error: "messages contain no text content" },
-      { status: 400 },
-    );
-  }
 
   const ai = new GoogleGenAI({ apiKey });
 
@@ -72,10 +121,12 @@ export async function POST(request: Request) {
     });
   } catch (err) {
     const { status, message, retryAfterSec } = mapGeminiError(err);
-    return Response.json(
-      { error: message, retryAfterSec },
-      { status },
-    );
+    await supabase.from("messages").insert({
+      conversation_id: conversationId,
+      role: "assistant",
+      content: `⚠️ ${message}`,
+    });
+    return Response.json({ error: message, retryAfterSec }, { status });
   }
 
   const encoder = new TextEncoder();
@@ -86,11 +137,13 @@ export async function POST(request: Request) {
         outputTokens?: number;
         totalTokens?: number;
       } = {};
+      let assistantText = "";
 
       try {
         for await (const chunk of geminiStream) {
           const text = chunk.text;
           if (text) {
+            assistantText += text;
             controller.enqueue(encoder.encode(text));
           }
           const meta = chunk.usageMetadata;
@@ -105,10 +158,19 @@ export async function POST(request: Request) {
         controller.enqueue(
           encoder.encode(`\n${USAGE_SENTINEL}${JSON.stringify(usage)}`),
         );
-        controller.close();
       } catch (err) {
         const { message } = mapGeminiError(err);
-        controller.enqueue(encoder.encode(`\n\n⚠️ ${message}`));
+        const errText = `\n\n⚠️ ${message}`;
+        assistantText += errText;
+        controller.enqueue(encoder.encode(errText));
+      } finally {
+        if (assistantText.trim().length > 0) {
+          await supabase.from("messages").insert({
+            conversation_id: conversationId,
+            role: "assistant",
+            content: assistantText,
+          });
+        }
         controller.close();
       }
     },

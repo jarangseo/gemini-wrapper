@@ -15,15 +15,34 @@ type Message = {
 type Conversation = {
   id: string;
   title: string;
-  updatedAt: string;
+  createdAt: string;
   messages: Message[];
+  messagesLoaded: boolean;
 };
 
-const SEED_CONVERSATIONS: Conversation[] = [
-  { id: "c1", title: "새 대화", updatedAt: "방금", messages: [] },
-];
-
 const USAGE_SENTINEL = "__USAGE__";
+const DAILY_REQUEST_LIMIT = 1000;
+const DAILY_TOKEN_BUDGET = 1_000_000;
+
+function formatTokens(n: number): string {
+  if (n < 1000) return n.toString();
+  if (n < 10_000) return (n / 1000).toFixed(2) + "K";
+  if (n < 1_000_000) return (n / 1000).toFixed(1) + "K";
+  return (n / 1_000_000).toFixed(2) + "M";
+}
+
+function formatRelative(iso: string): string {
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return "";
+  const diffMin = (Date.now() - then) / 60_000;
+  if (diffMin < 1) return "방금";
+  if (diffMin < 60) return `${Math.floor(diffMin)}분 전`;
+  const diffHr = diffMin / 60;
+  if (diffHr < 24) return `${Math.floor(diffHr)}시간 전`;
+  const diffDay = diffHr / 24;
+  if (diffDay < 7) return `${Math.floor(diffDay)}일 전`;
+  return new Date(iso).toLocaleDateString("ko-KR", { month: "short", day: "numeric" });
+}
 
 type UsageStats = {
   lastPrompt: number;
@@ -49,25 +68,131 @@ type Props = {
 
 export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
   const { signOut } = useAuth();
-  const [conversations, setConversations] = React.useState<Conversation[]>(SEED_CONVERSATIONS);
-  const [activeId, setActiveId] = React.useState<string>(SEED_CONVERSATIONS[0].id);
+  const [conversations, setConversations] = React.useState<Conversation[]>([]);
+  const [activeId, setActiveId] = React.useState<string | null>(null);
+  const [loadingList, setLoadingList] = React.useState(true);
   const [isStreaming, setIsStreaming] = React.useState(false);
   const [inputKey, setInputKey] = React.useState(0);
   const [usage, setUsage] = React.useState<UsageStats>(INITIAL_USAGE);
 
-  const active = conversations.find((c) => c.id === activeId) ?? conversations[0];
+  const active = activeId ? conversations.find((c) => c.id === activeId) ?? null : null;
 
-  const handleNewChat = () => {
-    if (isStreaming) return;
-    const id = `c-${Date.now()}`;
-    const fresh: Conversation = {
-      id,
-      title: "새 대화",
-      updatedAt: "방금",
-      messages: [],
+  // Initial load
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch("/api/conversations");
+        if (!res.ok) throw new Error(`Failed to load (${res.status})`);
+        const data = (await res.json()) as {
+          conversations: { id: string; title: string; created_at: string }[];
+        };
+        setConversations(
+          data.conversations.map((c) => ({
+            id: c.id,
+            title: c.title,
+            createdAt: c.created_at,
+            messages: [],
+            messagesLoaded: false,
+          })),
+        );
+      } catch (err) {
+        console.error("Failed to load conversations", err);
+      } finally {
+        setLoadingList(false);
+      }
+    })();
+  }, []);
+
+  // Load messages on switch
+  React.useEffect(() => {
+    if (!activeId) return;
+    const target = conversations.find((c) => c.id === activeId);
+    if (!target || target.messagesLoaded) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`/api/conversations/${activeId}/messages`);
+        if (!res.ok) throw new Error(`Failed to load messages (${res.status})`);
+        const data = (await res.json()) as {
+          messages: {
+            id: string;
+            role: "user" | "assistant";
+            content: string;
+            created_at: string;
+          }[];
+        };
+        if (cancelled) return;
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id !== activeId
+              ? c
+              : {
+                  ...c,
+                  messages: data.messages.map((m) => ({
+                    id: m.id,
+                    role: m.role,
+                    content: m.content,
+                  })),
+                  messagesLoaded: true,
+                },
+          ),
+        );
+      } catch (err) {
+        console.error("Failed to load messages", err);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
     };
-    setConversations((prev) => [fresh, ...prev]);
-    setActiveId(id);
+  }, [activeId, conversations]);
+
+  const createConversation = async (): Promise<Conversation | null> => {
+    try {
+      const res = await fetch("/api/conversations", { method: "POST" });
+      if (!res.ok) throw new Error(`Failed (${res.status})`);
+      const data = (await res.json()) as {
+        conversation: { id: string; title: string; created_at: string };
+      };
+      const fresh: Conversation = {
+        id: data.conversation.id,
+        title: data.conversation.title,
+        createdAt: data.conversation.created_at,
+        messages: [],
+        messagesLoaded: true,
+      };
+      setConversations((prev) => [fresh, ...prev]);
+      return fresh;
+    } catch (err) {
+      console.error("Failed to create conversation", err);
+      return null;
+    }
+  };
+
+  const handleNewChat = async () => {
+    if (isStreaming) return;
+    const fresh = await createConversation();
+    if (fresh) setActiveId(fresh.id);
+  };
+
+  const handleDelete = async (id: string) => {
+    if (isStreaming) return;
+    if (!confirm("이 대화를 삭제할까요?")) return;
+    try {
+      const res = await fetch(`/api/conversations/${id}`, { method: "DELETE" });
+      if (!res.ok && res.status !== 204) throw new Error(`Failed (${res.status})`);
+      setConversations((prev) => {
+        const next = prev.filter((c) => c.id !== id);
+        if (id === activeId) {
+          setActiveId(next[0]?.id ?? null);
+        }
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to delete conversation", err);
+      alert("삭제 중 오류가 발생했습니다.");
+    }
   };
 
   const appendChunkToAssistant = (conversationId: string, assistantId: string, chunk: string) => {
@@ -112,6 +237,15 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
     const content = (formData.get("message") as string | null)?.trim();
     if (!content) return;
 
+    // Auto-create conversation if none active
+    let conversation: Conversation | null = active;
+    if (!conversation) {
+      conversation = await createConversation();
+      if (!conversation) return;
+      setActiveId(conversation.id);
+    }
+    const conversationId = conversation.id;
+
     const userMessage: Message = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -124,8 +258,7 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
       pending: true,
     };
 
-    const conversationId = activeId;
-    const previousMessages = active.messages;
+    const previousMessages = conversation.messages;
     const isFirstMessage = previousMessages.length === 0;
 
     setConversations((prev) =>
@@ -135,7 +268,6 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
           : {
               ...c,
               title: isFirstMessage ? content.slice(0, 40) : c.title,
-              updatedAt: "방금",
               messages: [...c.messages, userMessage, assistantMessage],
             },
       ),
@@ -146,6 +278,7 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
 
     try {
       const payload = {
+        conversationId,
         messages: [...previousMessages, userMessage].map((m) => ({
           role: m.role,
           content: m.content,
@@ -164,7 +297,7 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
           const data = await res.json();
           if (data?.error) errorMessage = data.error;
         } catch {
-          /* ignore json parse error */
+          /* ignore */
         }
         finalizeAssistant(conversationId, assistantMessage.id, {
           content: `⚠️ ${errorMessage}`,
@@ -241,7 +374,9 @@ export function DashboardShell({ userName, userEmail, avatarUrl }: Props) {
         activeId={activeId}
         onSelect={setActiveId}
         onNewChat={handleNewChat}
+        onDelete={handleDelete}
         disabled={isStreaming}
+        loading={loadingList}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -271,13 +406,17 @@ function Sidebar({
   activeId,
   onSelect,
   onNewChat,
+  onDelete,
   disabled,
+  loading,
 }: {
   conversations: Conversation[];
-  activeId: string;
+  activeId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onDelete: (id: string) => void;
   disabled?: boolean;
+  loading?: boolean;
 }) {
   return (
     <aside className="hidden w-64 shrink-0 flex-col border-r border-border bg-[#0f0f0f] md:flex">
@@ -300,34 +439,78 @@ function Sidebar({
         <p className="px-2 pb-2 text-xs uppercase tracking-wider text-muted-foreground">
           대화 기록
         </p>
-        <ul className="space-y-0.5">
-          {conversations.map((c) => (
-            <li key={c.id}>
-              <button
-                type="button"
-                onClick={() => onSelect(c.id)}
-                className={
-                  "flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm transition " +
-                  (c.id === activeId
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground")
-                }
-              >
-                <span className="truncate">{c.title}</span>
-                <span className="shrink-0 text-[10px] text-muted-foreground/70">
-                  {c.updatedAt}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
+
+        {loading ? (
+          <p className="px-3 py-2 text-xs text-muted-foreground">불러오는 중…</p>
+        ) : conversations.length === 0 ? (
+          <p className="px-3 py-2 text-xs text-muted-foreground">아직 대화가 없습니다.</p>
+        ) : (
+          <ul className="space-y-0.5">
+            {conversations.map((c) => (
+              <li key={c.id}>
+                <ConversationItem
+                  conversation={c}
+                  active={c.id === activeId}
+                  onSelect={() => onSelect(c.id)}
+                  onDelete={() => onDelete(c.id)}
+                  disabled={disabled}
+                />
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </aside>
   );
 }
 
-const DAILY_REQUEST_LIMIT = 1000;
-const DAILY_TOKEN_BUDGET = 1_000_000;
+function ConversationItem({
+  conversation,
+  active,
+  onSelect,
+  onDelete,
+  disabled,
+}: {
+  conversation: Conversation;
+  active: boolean;
+  onSelect: () => void;
+  onDelete: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div
+      className={
+        "group flex items-center gap-1 rounded-lg pr-1 transition " +
+        (active
+          ? "bg-accent text-foreground"
+          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground")
+      }
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        className="flex flex-1 items-center justify-between gap-2 px-3 py-2 text-left text-sm"
+      >
+        <span className="truncate">{conversation.title}</span>
+        <span className="shrink-0 text-[10px] text-muted-foreground/70">
+          {formatRelative(conversation.createdAt)}
+        </span>
+      </button>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onDelete();
+        }}
+        disabled={disabled}
+        aria-label="대화 삭제"
+        className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground/60 opacity-0 transition group-hover:opacity-100 hover:bg-red-500/15 hover:text-red-400 disabled:cursor-not-allowed"
+      >
+        <TrashIcon className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
 
 function TopBar({
   userName,
@@ -414,16 +597,17 @@ function TopBar({
   );
 }
 
-function ChatArea({ conversation }: { conversation: Conversation }) {
+function ChatArea({ conversation }: { conversation: Conversation | null }) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
-  const totalChars = conversation.messages.reduce((sum, m) => sum + m.content.length, 0);
+  const totalChars =
+    conversation?.messages.reduce((sum, m) => sum + m.content.length, 0) ?? 0;
 
   React.useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [totalChars]);
+  }, [totalChars, conversation?.id]);
 
-  if (conversation.messages.length === 0) {
+  if (!conversation || conversation.messages.length === 0) {
     return (
       <div className="flex flex-1 items-center justify-center px-4">
         <div className="text-center">
@@ -497,18 +681,21 @@ function BlinkingCursor() {
   return <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/60" />;
 }
 
-function formatTokens(n: number): string {
-  if (n < 1000) return n.toString();
-  if (n < 10_000) return (n / 1000).toFixed(2) + "K";
-  if (n < 1_000_000) return (n / 1000).toFixed(1) + "K";
-  return (n / 1_000_000).toFixed(2) + "M";
-}
-
 function PlusIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
       <path d="M12 5v14" />
       <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function TrashIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
     </svg>
   );
 }
